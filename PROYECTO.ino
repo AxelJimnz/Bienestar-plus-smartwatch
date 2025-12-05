@@ -28,8 +28,8 @@
 #include "time.h"               // Gestión de hora mundial
 
 // --- 2. CREDENCIALES WI-FI (¡EDITAR AQUÍ!) ---
-const char* ssid     = "NOMBRE_DE_TU_WIFI";  // <-- Tu red
-const char* password = "CONTRASEÑA_WIFI";    // <-- Tu clave
+const char* ssid     = "RIUAEMFI";      // <--- Pon aquí tu red
+const char* password = ""; 
 
 // --- 3. CONFIGURACIÓN DE UMBRALES (ALERTAS) ---
 const int PIN_BUZZER = 18;          // Pin positivo del Buzzer
