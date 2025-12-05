@@ -1,313 +1,293 @@
 /**
  * ============================================================================
- * PROYECTO: MONITOR DE SIGNOS VITALES IOT CON ALERTAS (ESP32)
+ * PROYECTO: MONITOR DE SIGNOS VITALES IOT (IP EN SERIAL)
  * ============================================================================
- * * DESCRIPCIÓN:
- * Sistema que monitorea ritmo cardíaco (MAX30102) y temperatura ambiente (BMP280).
- * Muestra los datos en pantalla OLED, sincroniza hora/fecha vía WiFi (NTP)
- * y emite alertas visuales y sonoras (Buzzer) si los valores salen de rango.
- * * HARDWARE:
- * - MCU: ESP32 Dev Module
- * - Pantalla: OLED 0.96" I2C (SSD1306) -> Pines SDA(21), SCL(22)
- * - Sensor 1: MAX30102 (Pulso/Oxígeno) -> Pines SDA(21), SCL(22)
- * - Sensor 2: BMP280 (Temp/Presión)    -> Pines SDA(21), SCL(22)
- * - Actuador: Buzzer (Zumbador)        -> Pin GPIO 18
- * * AUTOR: [Tu Nombre]
- * FECHA: Diciembre 2025
+ * FUNCIONES:
+ * 1. IP se muestra en el MONITOR SERIAL (No en pantalla).
+ * 2. Webserver con datos en tiempo real.
+ * 3. Pantalla OLED con interfaz gráfica completa.
+ * 4. Alertas sonoras y visuales.
  * ============================================================================
  */
 
-// --- 1. LIBRERÍAS NECESARIAS ---
-#include <Wire.h>               // Comunicación I2C
-#include <Adafruit_GFX.h>       // Gráficos básicos
-#include <Adafruit_SSD1306.h>   // Controlador Pantalla OLED
-#include <Adafruit_BMP280.h>    // Controlador Sensor Temperatura
-#include "MAX30105.h"           // Controlador Sensor Pulso (Funciona para MAX30102)
-#include "heartRate.h"          // Algoritmo de detección de latidos
-#include <WiFi.h>               // Conexión Inalámbrica
-#include "time.h"               // Gestión de hora mundial
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_BMP280.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "time.h"
 
-// --- 2. CREDENCIALES WI-FI (¡EDITAR AQUÍ!) ---
-const char* ssid     = "RIUAEMFI";      // <--- Pon aquí tu red
-const char* password = ""; 
+const char* ssid     = "RIUAEMFI"; 
+const char* password = "";
 
-// --- 3. CONFIGURACIÓN DE UMBRALES (ALERTAS) ---
-const int PIN_BUZZER = 18;          // Pin positivo del Buzzer
-const float UMBRAL_TEMP_MAX = 30.0; // Alarma si T > 30°C (Bajo para pruebas fáciles)
-const int UMBRAL_BPM_MAX = 110;     // Alarma Taquicardia (>110)
-const int UMBRAL_BPM_MIN = 50;      // Alarma Bradicardia (<50)
+const int PIN_BUZZER = 18;
+const float UMBRAL_TEMP_MAX = 30.0;
+const int UMBRAL_BPM_MAX = 110;
+const int UMBRAL_BPM_MIN = 50;
 
-// --- 4. CONFIGURACIÓN HORARIA (NTP) ---
-// GMT Offset: Segundos de diferencia con UTC.
-// México Centro: UTC -6 horas = -6 * 3600 = -21600
-const long  gmtOffset_sec = -21600; 
-const int   daylightOffset_sec = 0;   // Horario de verano (0 si no aplica)
+WebServer server(80);
+const long  gmtOffset_sec = -21600; // México Centro (-6h)
+const int   daylightOffset_sec = 0;
 const char* ntpServer = "pool.ntp.org";
 
-// --- 5. DEFINICIÓN DE OBJETOS ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+MAX30105 particleSensor;
+Adafruit_BMP280 bmp; 
 
-MAX30105 particleSensor; // Objeto del sensor de pulso
-Adafruit_BMP280 bmp;     // Objeto del sensor de temperatura
+bool bmpStatus = false;
+bool alarmTriggered = false;
+bool buzzerState = false;
 
-// --- 6. VARIABLES GLOBALES ---
+const byte RATE_SIZE = 4; 
+byte rates[RATE_SIZE]; 
+byte rateSpot = 0;
+long lastBeat = 0; 
+float beatsPerMinute;
+int beatAvg = 0;
 
-// Estado del Hardware
-bool bmpStatus = false;      // True si BMP280 inicia bien
-bool alarmTriggered = false; // True si hay una emergencia activa
-bool buzzerState = false;    // Estado actual del sonido (On/Off)
+// Timers
+long lastScreenUpdate = 0;
+long lastBuzzerTone = 0;
 
-// Variables Matemáticas para el Pulso
-const byte RATE_SIZE = 4;    // Tamaño del promedio (últimos 4 latidos)
-byte rates[RATE_SIZE];       // Array de almacenamiento
-byte rateSpot = 0;           // Índice del array
-long lastBeat = 0;           // Momento exacto del último latido detectado
-float beatsPerMinute;        // Cálculo instantáneo (muy volátil)
-int beatAvg = 0;             // Promedio suavizado (Valor final a mostrar)
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monitor Signos Vitales</title>
+  <style>
+    body { font-family: 'Arial', sans-serif; background-color: #121212; color: #ffffff; text-align: center; margin: 0; }
+    h1 { color: #03dac6; margin-top: 20px; }
+    .card { background-color: #1e1e1e; max-width: 400px; margin: 20px auto; padding: 20px; border-radius: 15px; box-shadow: 0 4px 8px rgba(0,0,0,0.5); }
+    .data-val { font-size: 3rem; font-weight: bold; color: #ffffff; }
+    .unit { font-size: 1.2rem; color: #bbbbbb; }
+    .label { font-size: 1.2rem; color: #03dac6; text-transform: uppercase; letter-spacing: 2px; }
+    .alert-box { display: none; background-color: #cf6679; color: black; padding: 15px; margin-top: 20px; border-radius: 10px; font-weight: bold; animation: blink 1s infinite; }
+    @keyframes blink { 0% {opacity: 1;} 50% {opacity: 0.5;} 100% {opacity: 1;} }
+  </style>
+</head>
+<body>
+  <h1>Monitor Paciente IoT</h1>
+  <div class="card">
+    <div class="label">Temperatura</div>
+    <div id="temp" class="data-val">--</div><div class="unit">&deg;C</div>
+  </div>
+  <div class="card">
+    <div class="label">Ritmo Card&iacute;aco</div>
+    <div id="bpm" class="data-val">--</div><div class="unit">BPM</div>
+  </div>
+  <div id="warning" class="alert-box">&#9888; &iexcl;ALERTA DETECTADA!</div>
+<script>
+setInterval(function() { getData(); }, 1000);
+function getData() {
+  var xhttp = new XMLHttpRequest();
+  xhttp.onreadystatechange = function() {
+    if (this.readyState == 4 && this.status == 200) {
+      var data = JSON.parse(this.responseText);
+      document.getElementById("temp").innerHTML = data.temp;
+      document.getElementById("bpm").innerHTML = data.bpm;
+      var alertBox = document.getElementById("warning");
+      if(data.alert == true) {
+        alertBox.style.display = "block";
+        document.body.style.backgroundColor = "#3e1818";
+      } else {
+        alertBox.style.display = "none";
+        document.body.style.backgroundColor = "#121212";
+      }
+    }
+  };
+  xhttp.open("GET", "/data", true);
+  xhttp.send();
+}
+</script></body></html>
+)rawliteral";
 
-// Temporizadores (para multitarea sin delay)
-long lastScreenUpdate = 0;   // Controla refresco de pantalla
-long lastBuzzerTone = 0;     // Controla intermitencia del sonido
+// SERVIDOR
+void handleRoot() { server.send(200, "text/html", index_html); }
 
-// ============================================================================
-// FUNCIONES AUXILIARES (Hora y Fecha)
-// ============================================================================
-
-// Imprime HH:MM en la pantalla
-void printTime() {
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    display.print("--:--");
-    return;
-  }
-  char timeString[6];
-  strftime(timeString, 6, "%H:%M", &timeinfo);
-  display.print(timeString);
+void handleData() {
+  float t = 0;
+  if(bmpStatus) t = bmp.readTemperature();
+  String json = "{";
+  json += "\"temp\":\"" + String(t, 1) + "\",";
+  if(beatAvg > 0) json += "\"bpm\":\"" + String(beatAvg) + "\",";
+  else json += "\"bpm\":\"--\",";
+  json += "\"alert\":" + String(alarmTriggered ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
-// Imprime DD/MM/AAAA en la pantalla
-void printDate() {
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    display.print("Sincronizando...");
-    return;
-  }
-  char dateString[12];
-  strftime(dateString, 12, "%d/%m/%Y", &timeinfo);
-  display.print(dateString);
-}
-
-// ============================================================================
-// SETUP: CONFIGURACIÓN INICIAL
-// ============================================================================
 void setup() {
-  Serial.begin(115200); // Iniciar monitor serie para depuración
-
-  // Configurar Buzzer
+  Serial.begin(115200); // IMPORTANTE: Velocidad del monitor serial
   pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW); // Asegurar silencio
+  digitalWrite(PIN_BUZZER, LOW);
 
-  // A) INICIAR PANTALLA OLED
-  // Dirección I2C suele ser 0x3C
+  // 1. INICIAR PANTALLA
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("ERROR CRITICO: Pantalla OLED no encontrada"));
-    for(;;); // Detener ejecución
+    Serial.println(F("Error OLED")); for(;;);
   }
-  
-  // Mensaje de bienvenida
   display.clearDisplay();
   display.setTextColor(WHITE);
   display.setTextSize(1);
   display.setCursor(0, 10);
-  display.println("Iniciando Sistema...");
+  display.println("Conectando WiFi...");
   display.display();
 
-  // B) CONEXIÓN WIFI
+  // 2. CONECTAR WIFI
+  Serial.print("Conectando a WiFi");
   WiFi.begin(ssid, password);
   int retry = 0;
-  // Intentar conectar durante unos segundos
-  while (WiFi.status() != WL_CONNECTED && retry < 15) {
-    delay(500);
-    Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500); 
+    Serial.print("."); 
     retry++;
   }
-  
+  Serial.println(""); // Salto de línea
+
+  // ---------------------------------------------------------
+  // MOSTRAR IP EN MONITOR SERIAL
+  // ---------------------------------------------------------
   if (WiFi.status() == WL_CONNECTED) {
-    // Si conecta, obtenemos la hora de internet
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    display.println("WiFi: CONECTADO");
-  } else {
-    display.println("WiFi: ERROR (Offline)");
-  }
-  display.display();
-  delay(1000);
-
-  // C) INICIAR SENSOR TEMPERATURA (BMP280)
-  // Intentamos dirección 0x76 y luego 0x77
-  if (bmp.begin(0x76)) {
-    bmpStatus = true;
-    Serial.println("BMP280 OK (0x76)");
-  } else if (bmp.begin(0x77)) {
-    bmpStatus = true;
-    Serial.println("BMP280 OK (0x77)");
-  } else {
-    Serial.println("BMP280 ERROR");
-  }
-
-  // D) INICIAR SENSOR PULSO (MAX30102)
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("MAX30102 ERROR");
+    
+    // Imprimir en Serial (Consola)
+    Serial.println("==================================");
+    Serial.println("   CONEXION WIFI ESTABLECIDA");
+    Serial.println("==================================");
+    Serial.print(" DIRECCION IP:  http://");
+    Serial.println(WiFi.localIP());
+    Serial.println("==================================");
+    
+    // Feedback visual mínimo en pantalla
     display.clearDisplay();
     display.setCursor(0,0);
-    display.println("Error Sensor Pulso");
+    display.println("WiFi: CONECTADO");
+    display.println("Revisa Monitor Serial");
+    display.println("para ver la IP.");
     display.display();
-    // Continuamos aunque falle, pero no medirá pulso
+    delay(2000); 
+    
   } else {
-    Serial.println("MAX30102 OK");
+    Serial.println("ERROR: No se pudo conectar al WiFi.");
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println("Error WiFi");
+    display.display();
+    delay(2000);
+  }
+
+  // 3. INICIAR SENSORES
+  if (bmp.begin(0x76)) bmpStatus = true;
+  else if (bmp.begin(0x77)) bmpStatus = true;
+
+  if (particleSensor.begin(Wire, I2C_SPEED_FAST)) {
     particleSensor.setup(); 
-    // Ajuste de potencia LED (0x1F = Intensidad media/baja para evitar saturación)
     particleSensor.setPulseAmplitudeRed(0x1F);
     particleSensor.setPulseAmplitudeGreen(0);
   }
-  
-  display.clearDisplay();
+
+  // 4. INICIAR WEB SERVER
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("Servidor Web Iniciado.");
+}
+
+// Funciones auxiliares
+void printTime() {
+  struct tm timeinfo;
+  if(getLocalTime(&timeinfo)){
+    char timeString[6];
+    strftime(timeString, 6, "%H:%M", &timeinfo);
+    display.print(timeString);
+  } else display.print("--:--");
+}
+void printDate() {
+  struct tm timeinfo;
+  if(getLocalTime(&timeinfo)){
+    char dateString[12];
+    strftime(dateString, 12, "%d/%m/%Y", &timeinfo);
+    display.print(dateString);
+  }
 }
 
 // ============================================================================
-// LOOP: BUCLE PRINCIPAL
+// LOOP PRINCIPAL
 // ============================================================================
 void loop() {
-  
-  // --------------------------------------------------------------------------
-  // BLOQUE 1: PROCESAMIENTO RÁPIDO (Lectura de Pulso)
-  // Se ejecuta contínuamente sin delays para no perder datos.
-  // --------------------------------------------------------------------------
-  long irValue = particleSensor.getIR(); // Leer valor Infrarrojo crudo
+  server.handleClient(); // Atender Web
 
-  // checkForBeat analiza si hubo un cambio brusco en la luz (un latido)
+  // Lectura Pulso
+  long irValue = particleSensor.getIR();
   if (checkForBeat(irValue) == true) {
-    long delta = millis() - lastBeat; // Tiempo desde el último latido
+    long delta = millis() - lastBeat;
     lastBeat = millis();
-
-    beatsPerMinute = 60 / (delta / 1000.0); // Calcular BPM instantáneo
-
-    // Filtro: Descartar lecturas imposibles (<20 o >255)
+    beatsPerMinute = 60 / (delta / 1000.0);
     if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-      rates[rateSpot++] = (byte)beatsPerMinute; // Guardar en buffer
-      rateSpot %= RATE_SIZE; // Mover índice circular
-      
-      // Calcular promedio suave
+      rates[rateSpot++] = (byte)beatsPerMinute; 
+      rateSpot %= RATE_SIZE; 
       beatAvg = 0;
       for (byte x = 0 ; x < RATE_SIZE ; x++) beatAvg += rates[x];
       beatAvg /= RATE_SIZE;
     }
   }
-
-  // Si el valor IR es < 50,000, no hay dedo en el sensor -> BPM es 0
   if (irValue < 50000) beatAvg = 0;
 
-  // --------------------------------------------------------------------------
-  // BLOQUE 2: LÓGICA DE ALARMAS Y BUZZER
-  // Verifica umbrales y activa el sonido si es necesario.
-  // --------------------------------------------------------------------------
+  // Alarmas
   float currentTemp = 0;
   if (bmpStatus) currentTemp = bmp.readTemperature();
-
-  // Condiciones de Alerta:
   bool dangerTemp = (currentTemp > UMBRAL_TEMP_MAX);
-  // Solo alertamos por pulso si hay un dedo puesto (beatAvg > 0)
   bool dangerPulse = (beatAvg > 0) && (beatAvg > UMBRAL_BPM_MAX || beatAvg < UMBRAL_BPM_MIN);
 
   if (dangerTemp || dangerPulse) {
     alarmTriggered = true;
-    
-    // Generador de tono intermitente (BEEP - silencio - BEEP)
-    // Usamos millis() para no bloquear el procesador
-    if (millis() - lastBuzzerTone > 200) { // Cada 200ms cambia estado
+    if (millis() - lastBuzzerTone > 200) { 
       lastBuzzerTone = millis();
       buzzerState = !buzzerState;
       digitalWrite(PIN_BUZZER, buzzerState);
     }
   } else {
-    // Todo normal -> Apagar alarmas
     alarmTriggered = false;
     digitalWrite(PIN_BUZZER, LOW);
   }
 
-  // --------------------------------------------------------------------------
-  // BLOQUE 3: ACTUALIZACIÓN DE PANTALLA (Baja Velocidad)
-  // Se actualiza cada 250ms para no parpadear ni saturar la CPU.
-  // --------------------------------------------------------------------------
+  // Actualizar Pantalla (Cada 250ms)
   if (millis() - lastScreenUpdate > 250) {
     display.clearDisplay();
-
-    // --- ZONA SUPERIOR: Ambiente y Hora ---
+    
+    // Header
     display.setTextSize(1);
-    
-    // Temperatura (Izquierda)
     display.setCursor(0, 0);
-    if (dangerTemp) display.print("!! "); // Marca de alerta
-    if (bmpStatus) {
-      display.print(currentTemp, 1); 
-      display.cp437(true); display.write(167); display.print("C"); // Símbolo °
-    } else {
-      display.print("-- C");
-    }
+    if(dangerTemp) display.print("!! ");
+    if(bmpStatus) { display.print(currentTemp, 1); display.print("C"); }
+    display.setCursor(95, 0); printTime();
+    display.drawLine(0, 10, 128, 10, WHITE); 
 
-    // Hora (Derecha)
-    display.setCursor(95, 0); 
-    if(WiFi.status() == WL_CONNECTED) printTime();
-    else display.print("--:--");
-
-    display.drawLine(0, 10, 128, 10, WHITE); // Línea divisoria
-
-    // --- ZONA CENTRAL: Ritmo Cardíaco ---
+    // Body
     if (irValue < 50000) {
-      // Estado: Esperando dedo
-      display.setCursor(30, 25);
-      display.print("COLOCA EL");
-      display.setCursor(45, 38);
-      display.print("DEDO");
+      display.setCursor(30, 25); display.print("COLOCA DEDO");
     } else {
-      // Estado: Midiendo
       display.setCursor(0, 15);
-      if (dangerPulse) display.print("PULSO ANORMAL");
-      else display.print("Ritmo Normal");
-
-      // Número BPM Grande
-      display.setTextSize(3); 
-      display.setCursor(35, 25);
-      if(beatAvg > 0) display.print(beatAvg);
-      else display.print("--"); 
-      
-      // Unidad pequeña
-      display.setTextSize(1);
-      display.setCursor(105, 45);
-      display.print("BPM");
+      if(dangerPulse) display.print("ANOMALIA"); else display.print("Normal");
+      display.setTextSize(3); display.setCursor(35, 25);
+      if(beatAvg > 0) display.print(beatAvg); else display.print("--");
+      display.setTextSize(1); display.setCursor(105, 45); display.print("BPM");
     }
 
-    // --- ZONA INFERIOR: Fecha o Mensaje de Alerta ---
-    display.drawLine(0, 52, 128, 52, WHITE); // Línea divisoria inferior
+    // Footer
+    display.drawLine(0, 52, 128, 52, WHITE); 
     display.setCursor(35, 56);
-    
     if (alarmTriggered) {
-      // Si hay alarma, mostramos aviso parpadeante sincronizado con el buzzer
-      if (buzzerState) { 
-        display.setTextColor(BLACK, WHITE); // Texto negro, fondo blanco
-        display.print("PELIGRO");
-        display.setTextColor(WHITE);        // Restaurar color normal
-      } else {
-        display.print(" PELIGRO ");
-      }
-    } else {
-      // Si todo está bien, mostramos la fecha
-      if(WiFi.status() == WL_CONNECTED) printDate();
-      else display.print("Monitoreando...");
-    }
+      if (buzzerState) {
+        display.setTextColor(BLACK, WHITE); display.print("PELIGRO"); display.setTextColor(WHITE);
+      } else display.print(" PELIGRO ");
+    } else printDate();
 
-    display.display(); // Enviar buffer a la pantalla
-    lastScreenUpdate = millis(); // Resetear timer de pantalla
+    display.display();
+    lastScreenUpdate = millis();
   }
 }
